@@ -21,11 +21,9 @@ def default_u_true_func(x):
     return -np.sin(np.pi * x)
 
 class PINNSolver:
-    def __init__(self, layers, x, t, epochs = 5000, N_col=10000, boundary_condition=None, u_true_func=None, nu=0.01):
+    def __init__(self, layers, x, t, u0, epochs = 5000, N_col=10000, boundary_condition=None, nu=0.01):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.nu = nu
-
-        self.u_true_func = u_true_func if u_true_func is not None else default_u_true_func
 
         self.x = np.array(x)
         self.t = np.array(t)
@@ -37,7 +35,8 @@ class PINNSolver:
         self.grid = torch.tensor(np.hstack((self.X_flat, self.T_flat)), dtype=torch.float32).to(self.device)
 
         self.x0 = np.hstack((self.x[:, None], self.t[0] * np.ones_like(self.x)[:, None]))
-        self.u0 = self.u_true_func(self.x).reshape(-1, 1)
+        self.u0 = torch.tensor(u0).reshape(-1, 1)
+        self.u_0_graphs = u0
 
         self.X_lb = np.hstack((self.x[0] * np.ones_like(self.t)[:, None], self.t[:, None]))
         self.X_rb = np.hstack((self.x[-1] * np.ones_like(self.t)[:, None], self.t[:, None]))
@@ -59,7 +58,7 @@ class PINNSolver:
         self.u_pred = None
 
     def plot_initial_data(self):
-        plt.plot(self.x, self.u0)
+        plt.plot(self.x, self.u_0_graphs)
         plt.title('Initial Condition')
         plt.xlabel('x')
         plt.ylabel('u')
@@ -69,16 +68,11 @@ class PINNSolver:
     def plot_training_points_1D(self):
         plt.figure(figsize=(8, 6))
 
-        vmin = np.min(self.u0)
-        vmax = np.max(self.u0)
+        vmin = np.min(self.u_0_graphs)
+        vmax = np.max(self.u_0_graphs)
 
-        # Initial condition (horizontal line): t = 0
-        sc0 = plt.scatter(self.x0[:, 0], self.x0[:, 1], c=self.u0, cmap='coolwarm', vmin=vmin, vmax=vmax, s=25)
-
-        # Left boundary (vertical line): x = x_min
+        sc0 = plt.scatter(self.x0[:, 0], self.x0[:, 1], c=self.u_0_graphs, cmap='coolwarm', vmin=vmin, vmax=vmax, s=25)
         plt.scatter(self.X_lb[:, 0], self.X_lb[:, 1], c=self.u_boundary, cmap='coolwarm', vmin=vmin, vmax=vmax, s=25)
-
-        # Right boundary (vertical line): x = x_max
         plt.scatter(self.X_rb[:, 0], self.X_rb[:, 1], c=self.u_boundary, cmap='coolwarm', vmin=vmin, vmax=vmax, s=25)
 
         plt.xlabel("x")
@@ -124,14 +118,12 @@ class PINNSolver:
 
     def plot_solution(self):
 
-        # Reshape prediction to 2D and transpose to swap axes
         u_pred_2d = self.u_pred.reshape(len(self.x), len(self.t)).T  # Transpose to switch axes
 
-        # Plotting
         plt.figure(figsize=(6, 5))
         plt.imshow(u_pred_2d, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
                 origin='lower', aspect='auto', cmap='viridis')
-        plt.title("$\\hat{u}(x,t)$")
+        plt.title("$\\hat{u}(x,t)$"+" per ${nu}$="+f"{self.nu}")
         plt.xlabel("x")
         plt.ylabel("t")
         plt.colorbar(label="$\\hat{u}$")
@@ -139,10 +131,9 @@ class PINNSolver:
         plt.show()
 
     def plot_predicted_slices_grid(self, num_slices=6):
-        # Convert u_pred to 2D: shape (len(x), len(t))
+
         u_pred_2d = self.u_pred.reshape(len(self.x), len(self.t))
 
-        # Choose evenly spaced time indices
         time_indices = np.linspace(0, len(self.t) - 1, num_slices, dtype=int)
 
         plt.figure(figsize=(14, 8))
