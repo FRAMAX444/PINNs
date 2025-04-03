@@ -22,10 +22,6 @@ class PINN(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-def default_u_true_func(x):
-    return -np.sin(np.pi * x)
-
-
 class RusanovBurgersSolver:
     def __init__(self, u0, x=x, t=t, nu=0.01):
         self.x = x
@@ -179,31 +175,6 @@ class PINNSolver:
         with torch.no_grad():
             self.u_pred = self.model(self.grid).cpu().numpy()
 
-        
-    def plot_predicted_slices_grid(self, num_slices=6):
-
-        u_pred_2d = self.u_pred.reshape(len(self.x), len(self.t))
-
-        time_indices = np.linspace(0, len(self.t) - 1, num_slices, dtype=int)
-
-        plt.figure(figsize=(14, 8))
-        for i, idx in enumerate(time_indices):
-            t_val = self.t[idx]
-            u_pred_slice = u_pred_2d[:, idx]
-
-            plt.subplot(2, (num_slices + 1) // 2, i + 1)
-            plt.plot(self.x, u_pred_slice, 'r--', label='Predicted')
-            plt.title(f't = {t_val:.2f}')
-            plt.xlabel('x')
-            plt.ylabel('$\hat{u}(x,t)$')
-            plt.legend()
-            plt.grid(True)
-
-        plt.tight_layout()
-        plt.show()
-
-
-
 class ProblemSetUp:
     def __init__(self, u0, x=x, t=t, nu=0.01, layers=[2, 50, 50, 50, 1], boundaries=[], boundary_fn=None, auto_plot=False, auto_train=True):
         self.u0 = u0
@@ -282,3 +253,28 @@ class ProblemSetUp:
         plt.tight_layout()
         plt.show()
 
+    def plot_slices(self, num_slices=6):
+
+        u_pred_2d = self.PS.u_pred.reshape(len(self.x), len(self.t))
+        u_rusanov_2d = self.u_R.T  
+
+        time_indices = np.linspace(0, len(self.t) - 1, num_slices, dtype=int)
+
+        plt.figure(figsize=(16, 9))
+        for i, idx in enumerate(time_indices):
+            t_val = self.t[idx]
+            u_pred_slice = u_pred_2d[:, idx]
+            u_rusanov_slice = u_rusanov_2d[:, idx]
+
+            plt.subplot(2, (num_slices + 1) // 2, i + 1)
+            plt.plot(self.x, u_rusanov_slice, 'k-', linewidth=1.5, label='Rusanov')
+            plt.plot(self.x, u_pred_slice, 'r--', linewidth=1.5, label='PINN')
+
+            plt.title(f't = {t_val:.3f}')
+            plt.xlabel('x')
+            plt.ylabel('u(x,t)')
+            plt.grid(True)
+            plt.legend()
+
+        plt.tight_layout()
+        plt.show()
