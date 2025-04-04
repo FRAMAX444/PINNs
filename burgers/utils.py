@@ -6,9 +6,12 @@ import matplotlib.pyplot as plt
 
 x = np.linspace(-1, 1, 256)
 t = np.linspace(0, 1, 1000)
-
 print("Using default x and t values:")
 print("x:", len(x), "t:", len(t))
+torch.manual_seed(0)
+np.random.seed(0)
+
+layers = [2, 50, 50, 50, 1]
 
 class PINN(nn.Module):
     def __init__(self, layers):
@@ -82,7 +85,7 @@ class RusanovBurgersSolver:
 
 
 class PINNSolver:
-    def __init__(self, u0, x=x, t=t, layers = [2, 50,50,50,1], epochs = 5000, N_col=100000, boundary_condition=None, nu=0.01):
+    def __init__(self, u0, x=x, t=t, layers = layers, epochs = 5000, N_col=50000, nu=0.01, boundary_condition=None, save_model = None, load_model = None):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.nu = nu
 
@@ -111,12 +114,14 @@ class PINNSolver:
         self.x_col = np.random.uniform(self.x[0], self.x[-1], (self.N_col, 1))
         self.t_col = np.random.uniform(self.t[0], self.t[-1], (self.N_col, 1))
         self.X_col = torch.tensor(np.hstack((self.x_col, self.t_col)), dtype=torch.float32).to(self.device)
-
         self.model = PINN(layers).to(self.device)
+        if load_model:
+            self.model.load_state_dict(torch.load(load_model))
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-3)
         self.loss_fn = nn.MSELoss()
         self.epochs = epochs
         self.u_pred = None
+        self.save_model = save_model
 
     def plot_initial_data(self):
         plt.plot(self.x, self.u0_np)
@@ -171,62 +176,94 @@ class PINNSolver:
             self.optimizer.step()
             if epoch % 500 == 0:
                 print(f"Epoch {epoch}, Loss: {loss.item():.6f}")
+        if self.save_model:
+            torch.save(self.model.state_dict(), self.save_model)
+
+    def Pred(self):
         self.model.eval()
         with torch.no_grad():
             self.u_pred = self.model(self.grid).cpu().numpy()
+    
+    def plot(self):
+        if self.u_pred is None:
+            print("Run the Train method before plotting.")
+            return
+
+        u_pred_2d = self.u_pred.reshape(len(self.x), len(self.t)).T  # Transpose to match (t, x)
+
+        common_vmin = np.min(u_pred_2d)
+        common_vmax = np.max(u_pred_2d)
+
+        fig, axs = plt.subplots(1, 1, figsize=(8, 5))
+
+        im = axs.imshow(u_pred_2d, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
+                        origin='lower', aspect='auto', cmap='viridis',
+                        vmin=common_vmin, vmax=common_vmax)
+        axs.set_title(r"PINN $\hat{u}(x,t)$ con $\nu$ = {:.3g}".format(self.nu))
+        axs.set_xlabel("x")
+        axs.set_ylabel("t")
+        fig.colorbar(im, ax=axs, label=r"$\hat{u}$")
+
+        plt.tight_layout()
+        plt.show()
+
+
 
 class ProblemSetUp:
-    def __init__(self, u0, x=x, t=t, nu=0.01, layers=[2, 50, 50, 50, 1], boundaries=[], boundary_fn=None, auto_plot=False, auto_train=True):
+    def __init__(self, u0, x=x, t=t, nu=0.01, layers=layers, boundaries=[], boundary_fn=None, auto_plot=False, save_model = None, load_model = None):
         self.u0 = u0
         self.x = x
         self.t = t
+        self.layers = layers
         self.nu = nu
         self.boundaries = boundaries
         self.boundary_fn = boundary_fn
-
+        self.save_model = save_model
+        self.load_model = load_model
         self.PS = PINNSolver(
-            u0=u0,
-            x=x,
-            t=t,
-            layers=layers,
+            u0=self.u0,
+            x=self.x,
+            t=self.t,
+            layers=self.layers,
             epochs=5000,
-            N_col=50000,
+            N_col=100000,
             boundary_condition=None,
-            nu=nu
-        )
+            nu=self.nu,
+            save_model=self.save_model,
+            load_model=self.load_model
+            )
 
         self.R = RusanovBurgersSolver(
-            u0=u0,
-            x=x,
-            t=t,
-            nu=nu,
+            u0=self.u0,
+            x=self.x,
+            t=self.t,
+            nu=self.nu,
         )
         self.u_R = self.R.solve()  
-        # print(self.u_R.shape)
+
         if auto_plot:
             self.PS.plot_initial_data()
             self.PS.plot_training_points_1D()
 
-        if auto_train:
+        if not load_model:
             self.PS.Train()
 
-    def plot_solution(self):
+        self.PS.Pred()
+
+    def plot_solution(self, vmax=None, vmin=None):
         u_pred_2d = self.PS.u_pred.reshape(len(self.x), len(self.t)).T  # Transpose to match (t, x)
         residual = u_pred_2d - self.u_R
 
         # Use common color scale for u_R and u_pred
-        common_vmin = min(self.u_R.min(), u_pred_2d.min())
-        common_vmax = max(self.u_R.max(), u_pred_2d.max())
-        
-        # Residual color scale (symmetric around 0)
-        res_max = max(abs(residual.min()), abs(residual.max()))
+        if not vmin: vmin = min(self.u_R.min(), u_pred_2d.min())
+        if not vmax: vmax = max(self.u_R.max(), u_pred_2d.max())
 
         fig, axs = plt.subplots(1, 3, figsize=(18, 5))
 
         # Rusanov
         im0 = axs[0].imshow(self.u_R, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
                             origin='lower', aspect='auto', cmap='viridis',
-                            vmin=common_vmin, vmax=common_vmax)
+                            vmin=vmin, vmax=vmax)
         axs[0].set_title(r"Rusanov $u(x,t)$ con $\nu$ = {:.3g}".format(self.nu))
         axs[0].set_xlabel("x")
         axs[0].set_ylabel("t")
@@ -235,7 +272,7 @@ class ProblemSetUp:
         # PINN Prediction
         im1 = axs[1].imshow(u_pred_2d, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
                             origin='lower', aspect='auto', cmap='viridis',
-                            vmin=common_vmin, vmax=common_vmax)
+                            vmin=vmin, vmax=vmax)
         axs[1].set_title(r"PINN $\hat{{u}}(x,t)$ con $\nu$ = {:.3g}".format(self.nu))
         axs[1].set_xlabel("x")
         axs[1].set_ylabel("t")
@@ -244,7 +281,7 @@ class ProblemSetUp:
         # Residual
         im2 = axs[2].imshow(residual, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
                             origin='lower', aspect='auto', cmap='seismic',
-                            vmin=common_vmin, vmax=common_vmax)
+                            vmin=vmin, vmax=vmax)
         axs[2].set_title(r"Residuo: $\hat{{u}} - u_{{R}}$")
         axs[2].set_xlabel("x")
         axs[2].set_ylabel("t")
@@ -253,18 +290,21 @@ class ProblemSetUp:
         plt.tight_layout()
         plt.show()
 
-    def plot_slices(self, num_slices=6):
-
+    def plot_slices(self, num_slices=6, vmax = None, vmin = None):
         u_pred_2d = self.PS.u_pred.reshape(len(self.x), len(self.t))
         u_rusanov_2d = self.u_R.T  
 
         time_indices = np.linspace(0, len(self.t) - 1, num_slices, dtype=int)
 
+        # Determine global min and max for y-axis
+        if not vmin: vmin = min(u_pred_2d.min(), u_rusanov_2d.min())
+        if not vmax: vmax = max(u_pred_2d.max(), u_rusanov_2d.max())
+
         plt.figure(figsize=(16, 9))
         for i, idx in enumerate(time_indices):
             t_val = self.t[idx]
             u_pred_slice = u_pred_2d[:, idx]
-            u_rusanov_slice = u_rusanov_2d[:, idx]
+            u_rusanov_slice = u_rusanov_2d[:, int(idx)]
 
             plt.subplot(2, (num_slices + 1) // 2, i + 1)
             plt.plot(self.x, u_rusanov_slice, 'k-', linewidth=1.5, label='Rusanov')
@@ -273,6 +313,7 @@ class ProblemSetUp:
             plt.title(f't = {t_val:.3f}')
             plt.xlabel('x')
             plt.ylabel('u(x,t)')
+            plt.ylim(vmin, vmax)
             plt.grid(True)
             plt.legend()
 
