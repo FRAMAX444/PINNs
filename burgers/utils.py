@@ -171,7 +171,7 @@ class PINN:
         self, u0, x, t, layers,
         epochs=5000, nu=0.1, equation='burgers',
         N = (1000, 1000, 5000), lr = 1e-3, real_solution=None,
-        bc_type='dirichlet', save_model=None
+        bc_type='dirichlet', path=None
     ):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -181,9 +181,17 @@ class PINN:
         self.equation = equation.lower()
         self.real_solution = real_solution
         self.bc_type = bc_type.lower()
-        self.save_model = save_model
-
         self.model = MLP(layers).to(self.device)
+        self.path = path
+        self.losses = []
+        if path is not None:
+            try:
+                self.model.load_state_dict(torch.load(path))
+                self.losses = np.load(path.replace('.pth', '_losses.npy'))
+                self.loaded = True
+            except FileNotFoundError:
+                self.loaded = False
+
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.loss_fn = nn.MSELoss()
 
@@ -208,7 +216,6 @@ class PINN:
         X, T = np.meshgrid(self.x, self.t, indexing='ij')
         XT = np.hstack((X.flatten()[:, None], T.flatten()[:, None]))
         self.grid = torch.tensor(XT, dtype=torch.float32, device=self.device)
-        self.losses = []
         self.N_ic, self.N_bc, self.N_col = N
 
     def sample_collocation(self, N):
@@ -308,8 +315,10 @@ class PINN:
             self.losses.append((li, lb, lf, loss.item()))
             if ep % (self.epochs // 10 or 1) == 0:
                 print(f"PINN: [{ep:5d}/{self.epochs}] | Loss={loss.item():.3e} | PDE={lf:.3e} | BC={lb:.3e} | IC={li:.3e}")
-        if self.save_model:
-            torch.save(self.model.state_dict(), self.save_model)
+        if not self.loaded:
+            torch.save(self.model.state_dict(), self.path)
+            losses = np.array(self.losses)
+            np.save(self.path.replace('.pth', '_losses.npy'), losses)
 
     def Pred(self):
         self.model.eval()
@@ -333,7 +342,7 @@ class PINN:
 
 class wPINN:
     def __init__(self, u0, x, t, layers, epochs = 5000, N = (1000, 1000, 5000), lr=1e-3,
-                 bc_type='dirichlet', lambda_bc=1.0, adv_steps=5, save_model = None):
+                 bc_type='dirichlet', lambda_bc=1.0, adv_steps=5, path=None):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -354,6 +363,16 @@ class wPINN:
         self.adv_steps = adv_steps
 
         self.u_net   = MLP(layers).to(self.device)
+        self.path = path
+        self.losses = []
+        if self.path is not None:
+            try:
+                self.u_net.load_state_dict(torch.load(self.path))
+                self.losses = np.load(self.path.replace('.pth', '_losses.npy'))
+                self.loaded = True
+            except FileNotFoundError:
+                self.loaded = False
+
         self.phi_net = MLP(layers).to(self.device)
         self.xi_net  = MLP(layers).to(self.device)
 
@@ -364,10 +383,8 @@ class wPINN:
         T_mesh, X_mesh = np.meshgrid(self.t, self.x, indexing='ij')  # shapes (nt,nx)
         stacked = np.hstack((T_mesh.flatten()[:,None], X_mesh.flatten()[:,None]))  # (nt*nx,2)
         self.grid = torch.tensor(stacked, dtype=torch.float32, device=self.device)
-        self.losses = []
         self.U_pred = None
         self.N_ic, self.N_bc, self.N_int = N
-        self.save_model = save_model
         self.epochs = epochs
         self.bc_type = bc_type.lower()
 
@@ -494,6 +511,10 @@ class wPINN:
 
             if epoch % (self.epochs//10 or 1) == 0:
                 print(f"wPINN: [{epoch}/{self.epochs}] | Loss={loss.item():.2e} | PDE={Lu_PDE.item():.2e} | Ent={L_ent.item():.2e} | BC={L_bc.item():.2e} | IC={L_ic.item():.2e}")
+        if not self.loaded:
+            torch.save(self.u_net.state_dict(), self.path)
+            losses = np.array(self.losses)
+            np.save(self.path.replace('.pth', '_losses.npy'), losses)
 
     def Pred(self):
         self.u_net.eval()
@@ -518,11 +539,9 @@ class ProblemSetUp:
     def __init__(self, u0, x, t, layers, lr=1e-3, 
                  epochs=5000, N=(1000,1000,5000), nu=0.1,
                  equation='burgers', real_solution=None,
-                 parameters=[5.0, 1.0, 1.0],
-                 bc_type='dirichlet',
-                 lambda_bc=1.0, adv_steps=5,
-                 model = 'PINN', auto_train = True,
-                 save_model=None, load_model=None):
+                 bc_type='dirichlet', lambda_bc=1.0, 
+                 adv_steps=5, model = 'PINN', 
+                 auto_train = True, path=None):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.lower()
@@ -531,8 +550,6 @@ class ProblemSetUp:
         self.equation = equation.lower()
         self.bc_type = bc_type.lower()
         self.auto_train = auto_train
-        self.save_model = save_model
-        self.load_model = load_model
         self.losses = []
         self.u0_np = (u0.copy() if isinstance(u0, np.ndarray)
                         else (u0.detach().cpu().numpy() if torch.is_tensor(u0)
@@ -544,23 +561,19 @@ class ProblemSetUp:
         self.t_min, self.t_max = float(self.t.min()), float(self.t.max())
         self.L = self.x_max - self.x_min
 
-
         if self.model == 'pinn':
-            self.pinn = PINN(u0, x, t, layers, epochs=epochs, nu=nu, 
-                             equation=equation, N=N, lr=lr, real_solution=real_solution,
-                             bc_type=bc_type, save_model=save_model)
+            self.pinn = PINN(u0, x, t, layers, epochs=epochs, nu=nu, equation=equation, 
+                            N=N, lr=lr, real_solution=real_solution, bc_type=bc_type, path=path)
         elif self.model == 'wpinn':
-            self.pinn = wPINN(u0, x, t, layers, epochs=epochs, N=N, lr=lr, 
-                              bc_type=bc_type, lambda_bc=lambda_bc, adv_steps=adv_steps)
+            self.pinn = wPINN(u0, x, t, layers, epochs=epochs, N=N, lr=lr, bc_type=bc_type, 
+                            lambda_bc=lambda_bc, adv_steps=adv_steps, path=path)
         
-        if auto_train:
+        if auto_train and not self.pinn.loaded:
             self.pinn.Train()
-            self.pinn.Pred()
-            self.U_pred = self.pinn.U_pred
-            self.losses = self.pinn.losses
 
-        if load_model:
-            self.model.load_state_dict(torch.load(load_model))
+        self.pinn.Pred()
+        self.U_pred = self.pinn.U_pred
+        self.losses = self.pinn.losses
 
         if self.real_solution is not None:
             self.U_exact = real_solution
@@ -575,14 +588,13 @@ class ProblemSetUp:
         self.U_err = self.U_pred - self.U_exact
 
     def plot_losses(self):
-        if not self.losses:
+        if self.losses is None or len(self.losses) == 0:
             print("No losses to plot.")
             return
 
         first_len = len(self.losses[0])
 
         if first_len == 4:
-            # (IC, BC, Physics, Total)
             loss_init_vals  = [l[0] for l in self.losses]
             loss_bound_vals = [l[1] for l in self.losses]
             loss_phys_vals  = [l[2] for l in self.losses]
@@ -590,7 +602,6 @@ class ProblemSetUp:
             labels = ['IC Loss', 'BC Loss', 'Physics Loss', 'Total Loss']
 
         elif first_len == 5:
-            # (PDE, Entropy, IC, BC, Total)
             loss_pde_vals   = [l[0] for l in self.losses]
             loss_ent_vals   = [l[1] for l in self.losses]
             loss_init_vals  = [l[2] for l in self.losses]
@@ -632,10 +643,11 @@ class ProblemSetUp:
     def plot_comparison(self):
         vmin = min(self.U_pred.min(), self.U_exact.min())   
         vmax = max(self.U_pred.max(), self.U_exact.max())
+        vmean = max(abs(vmin), abs(vmax))
         fig, axs = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
         im0 = axs[0].pcolormesh(self.x, self.t, self.U_pred, shading='auto', cmap='jet', vmin=vmin, vmax=vmax)
         title0 = "wPINN" if self.model == 'wpinn' else "PINN"
-        axs[0].set_title(f"{title0} $\hat{{u}}$")
+        axs[0].set_title(title0 + " $\\hat{u}$")
         axs[0].set_xlabel("x"); axs[0].set_ylabel("t")
         fig.colorbar(im0, ax=axs[0], label=r"$u_{pred}$")
 
@@ -648,7 +660,7 @@ class ProblemSetUp:
         axs[1].set_xlabel("x"); axs[1].set_ylabel("t")
         fig.colorbar(im1, ax=axs[1], label=r"$u_{exact}$")
 
-        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=vmin/10, vmax=vmax/10)
+        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-vmean/15, vmax=vmean/15)
         axs[2].set_title(r"Errore $\hat{{u}} - u$")
         axs[2].set_xlabel("x"); axs[2].set_ylabel("t")
         fig.colorbar(im2, ax=axs[2], label="errore")
@@ -691,10 +703,18 @@ class ProblemSetUp:
         plt.tight_layout()
         plt.show()
 
-    def compute_l2_error(self):
+
+    def l2_error(self):
+
         Nt, Nx = self.U_err.shape
         dx = (self.x_max - self.x_min) / (Nx - 1)
         dt = (self.t[-1] - self.t[0]) / (Nt - 1)
-        l2_abs = np.sqrt(np.sum(self.U_err**2) * dx * dt)
-        l2_exact = np.sqrt(np.sum(self.U_exact**2) * dx * dt)
-        return l2_abs, l2_abs / l2_exact
+
+        l2_abs = np.sqrt(np.sum(self.U_err   ** 2) * dx * dt)
+        l2_exact = np.sqrt(np.sum(self.U_exact ** 2) * dx * dt)
+        l2_rel = l2_abs / l2_exact if l2_exact != 0 else float('inf')
+
+        header = "Metriche di Errore L2"
+        print(f"\n{header}\n{'-' * len(header)}")
+        print(f"{'Errore L2 assoluto':<30}: {l2_abs:.6e}")
+        print(f"{'Errore L2 relativo':<30}: {l2_rel:.6e}\n")
