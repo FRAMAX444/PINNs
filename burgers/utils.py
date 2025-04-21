@@ -660,7 +660,7 @@ class ProblemSetUp:
         axs[1].set_xlabel("x"); axs[1].set_ylabel("t")
         fig.colorbar(im1, ax=axs[1], label=r"$u_{exact}$")
 
-        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-vmean/15, vmax=vmean/15)
+        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-vmean/3, vmax=vmean/3)
         axs[2].set_title(r"Errore $\hat{{u}} - u$")
         axs[2].set_xlabel("x"); axs[2].set_ylabel("t")
         fig.colorbar(im2, ax=axs[2], label="errore")
