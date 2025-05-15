@@ -6,11 +6,11 @@ import torch.autograd as autograd
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+import sympy
+from sympy import printing
+from tqdm import tqdm
 
-x = np.linspace(-1, 1, 256)
-t = np.linspace(0, 1, 1000)
-print("Using default x and t values:")
-print("x:", len(x), "t:", len(t))
+
 torch.manual_seed(0)
 np.random.seed(0)
 
@@ -27,6 +27,46 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+def burgers_analytical_solution(xs, ts, nu=0.01, M=5, Ny=801):
+    x_min, x_max = -1.0, 1.0
+
+    # Precompute y-grid and weights
+    ys = np.linspace(x_min, x_max, Ny, endpoint=False)
+    dy = (x_max - x_min) / Ny
+
+    # H(y) = ∫_{-1}^y u0(s) ds = (cos(pi y) + 1)/pi
+    Hys = (np.cos(np.pi * ys) + 1.0) / np.pi
+
+    # Weight N(y) = exp( -H(y)/(2 nu) )
+    Nys = np.exp(-Hys / (2 * nu))
+
+    # Allocate solution array
+    U = np.zeros((len(ts), len(xs)))
+
+    # Loop over time
+    for it, t in tqdm(enumerate(ts), total=len(ts)):
+        # accumulators for numerator and denominator integrals
+        numer = np.zeros_like(xs)
+        denom = np.zeros_like(xs)
+
+        # Sum over periodic images
+        for m in range(-M, M + 1):
+            # Z_ij = x_i - y_j + 2m
+            Z = xs[:, None] - ys[None, :] + 2 * m
+            # heat kernel G(Z; t)
+            G = np.exp(-Z**2 / (4 * nu * t)) / np.sqrt(4 * np.pi * nu * t)
+
+            # accumulate weighted integrals
+            # denom_i += ∑_j N(y_j) G_ij * dy
+            denom += (Nys[None, :] * G).sum(axis=1) * dy
+            # numer_i += ∑_j N(y_j) G_ij * Z_ij * dy
+            numer += (Nys[None, :] * G * Z).sum(axis=1) * dy
+
+        # u(x,t) = numer / (t * denom)
+        U[it, :] = numer / (t * denom)
+
+    return U
 
 class HeatSolver:
     def __init__(self, u0, x, t, alpha=1.0):
@@ -184,6 +224,7 @@ class PINN:
         self.model = MLP(layers).to(self.device)
         self.path = path
         self.losses = []
+        self.loaded = None
         if path is not None:
             try:
                 self.model.load_state_dict(torch.load(path))
@@ -315,7 +356,7 @@ class PINN:
             self.losses.append((li, lb, lf, loss.item()))
             if ep % (self.epochs // 10 or 1) == 0:
                 print(f"PINN: [{ep:5d}/{self.epochs}] | Loss={loss.item():.3e} | PDE={lf:.3e} | BC={lb:.3e} | IC={li:.3e}")
-        if not self.loaded:
+        if self.loaded == False:
             torch.save(self.model.state_dict(), self.path)
             losses = np.array(self.losses)
             np.save(self.path.replace('.pth', '_losses.npy'), losses)
@@ -365,6 +406,7 @@ class wPINN:
         self.u_net   = MLP(layers).to(self.device)
         self.path = path
         self.losses = []
+        self.loaded = None
         if self.path is not None:
             try:
                 self.u_net.load_state_dict(torch.load(self.path))
@@ -432,7 +474,6 @@ class wPINN:
     def compute_boundary_loss(self):
         t_bc = torch.rand(self.N_bc, 1, device=self.device) * (self.t_max - self.t_min) + self.t_min
 
-        # stack two blocks: one at x_min, one at x_max
         t_bc_cat = torch.cat([t_bc, t_bc], dim=0)
         x_bc = torch.cat([torch.full_like(t_bc, self.x_min),
                           torch.full_like(t_bc, self.x_max)], dim=0)
@@ -441,9 +482,8 @@ class wPINN:
         u_pred = self.u_net(X_bc)
 
         if self.bc_type == 'dirichlet':
-            # target = initial u0 at the boundary points
-            u_left  = self.u0[0]       # u0 at x_min
-            u_right = self.u0[-1]      # u0 at x_max
+            u_left  = self.u0[0]  
+            u_right = self.u0[-1]     
             u_true  = torch.cat([
                 u_left .expand(self.N_bc,1),
                 u_right.expand(self.N_bc,1)
@@ -451,7 +491,6 @@ class wPINN:
             return (u_pred - u_true).pow(2).mean()
 
         elif self.bc_type == 'neumann':
-            # compute u_x by auto‐diff
             Xb = X_bc.clone().requires_grad_(True)
             u_b = self.u_net(Xb)
             u_x = autograd.grad(u_b,
@@ -459,7 +498,6 @@ class wPINN:
                                 grad_outputs=torch.ones_like(u_b),
                                 create_graph=True)[0]
 
-            # target = initial spatial derivative at boundaries
             ux_left  = self.u0_x[0]
             ux_right = self.u0_x[-1]
             g_true   = torch.cat([
@@ -469,7 +507,6 @@ class wPINN:
             return (u_x - g_true).pow(2).mean()
 
         elif self.bc_type == 'periodic':
-            # leave periodic unchanged
             X_lb = torch.cat([t_bc, torch.full_like(t_bc, self.x_min)], dim=1)
             X_rb = torch.cat([t_bc, torch.full_like(t_bc, self.x_max)], dim=1)
             return (self.u_net(X_lb) - self.u_net(X_rb)).pow(2).mean()
@@ -511,7 +548,7 @@ class wPINN:
 
             if epoch % (self.epochs//10 or 1) == 0:
                 print(f"wPINN: [{epoch}/{self.epochs}] | Loss={loss.item():.2e} | PDE={Lu_PDE.item():.2e} | Ent={L_ent.item():.2e} | BC={L_bc.item():.2e} | IC={L_ic.item():.2e}")
-        if not self.loaded:
+        if self.loaded == False:
             torch.save(self.u_net.state_dict(), self.path)
             losses = np.array(self.losses)
             np.save(self.path.replace('.pth', '_losses.npy'), losses)
@@ -587,106 +624,114 @@ class ProblemSetUp:
 
         self.U_err = self.U_pred - self.U_exact
 
-    def plot_losses(self):
-        if self.losses is None or len(self.losses) == 0:
+    def plot_losses(self, window: int = 200, eps: float = 1e-8, figsize=(12,6)):
+
+        if not self.losses.any():
             print("No losses to plot.")
             return
 
-        first_len = len(self.losses[0])
+        arr = np.array(self.losses, dtype=float)
+        N, M = arr.shape
 
-        if first_len == 4:
-            loss_init_vals  = [l[0] for l in self.losses]
-            loss_bound_vals = [l[1] for l in self.losses]
-            loss_phys_vals  = [l[2] for l in self.losses]
-            total_loss_vals = [l[3] for l in self.losses]
-            labels = ['IC Loss', 'BC Loss', 'Physics Loss', 'Total Loss']
-
-        elif first_len == 5:
-            loss_pde_vals   = [l[0] for l in self.losses]
-            loss_ent_vals   = [l[1] for l in self.losses]
-            loss_init_vals  = [l[2] for l in self.losses]
-            loss_bound_vals = [l[3] for l in self.losses]
-            total_loss_vals = [l[4] for l in self.losses]
-            labels = ['PDE Loss', 'Entropy Loss', 'IC Loss', 'BC Loss', 'Total Loss']
-
+        if M == 4:
+            labels = ['Loss IC', 'Loss BC', 'Loss PDE', 'Loss Totale']
+        elif M == 5:
+            labels = ['Loss PDE', 'Loss Entropia', 'Loss IC', 'Loss BC', 'Loss Totale']
         else:
-            raise ValueError(f"Unexpected loss‐tuple length: {first_len}")
+            raise ValueError(f"Unexpected loss‐tuple length: {M}")
 
-        epochs = range(1, len(self.losses) + 1)
+        color_map = {
+            'Loss PDE':      'blue',
+            'Loss IC':       'green',
+            'Loss BC':       'red',
+            'Loss Totale':   'purple',
+            'Loss Entropia': 'orange',
+        }
 
-        plt.figure(figsize=(10, 6))
+        cols = [np.clip(arr[:, i], eps, None) for i in range(M)]
 
-        # plot in order depending on tuple shape
-        if first_len == 4:
-            plt.plot(epochs, loss_init_vals,  label=labels[0])
-            plt.plot(epochs, loss_bound_vals, label=labels[1])
-            plt.plot(epochs, loss_phys_vals,  label=labels[2])
-            plt.plot(epochs, total_loss_vals, label=labels[3])
+        def moving_average(x, w):
+            return np.convolve(x, np.ones(w)/w, mode='valid')
 
-        else:  # first_len == 5
-            plt.plot(epochs, loss_pde_vals,   label=labels[0])
-            plt.plot(epochs, loss_ent_vals,   label=labels[1])
-            plt.plot(epochs, loss_init_vals,  label=labels[2])
-            plt.plot(epochs, loss_bound_vals, label=labels[3])
-            plt.plot(epochs, total_loss_vals, label=labels[4])
+        smooth = [moving_average(c, window) for c in cols]
 
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Loss vs Epoch (log scale)')
-        plt.yscale('log')
-        plt.legend()
-        plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+        epochs = np.arange(len(smooth[0])) + window//2 + 1
+
+        fig, ax = plt.subplots(figsize=figsize)
+        for lbl, series in zip(labels, smooth):
+            lw = 2 if "Totale" in lbl else 1
+            alpha = 0.9 if "Totale" in lbl else 0.7
+            ax.semilogy(epochs, series,
+                        label=lbl,
+                        color=color_map.get(lbl, 'black'),
+                        linewidth=lw,
+                        alpha=alpha)
+        
+        title0 = "wPINN" if self.model == 'wpinn' else "PINN"
+
+        ax.set_xlabel("Epoca")
+        ax.set_ylabel("Loss (scala logaritmica)")
+        ax.set_title(title0)
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.legend()
         plt.tight_layout()
         plt.show()
+
+        return fig, ax
 
 
     def plot_comparison(self):
         vmin = min(self.U_pred.min(), self.U_exact.min())   
         vmax = max(self.U_pred.max(), self.U_exact.max())
-        vmean = max(abs(vmin), abs(vmax))
+        verr = abs(self.U_err[:-2].max())
         fig, axs = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
         im0 = axs[0].pcolormesh(self.x, self.t, self.U_pred, shading='auto', cmap='jet', vmin=vmin, vmax=vmax)
         title0 = "wPINN" if self.model == 'wpinn' else "PINN"
-        axs[0].set_title(title0 + " $\\hat{u}$")
+        axs[0].set_title(title0)
         axs[0].set_xlabel("x"); axs[0].set_ylabel("t")
-        fig.colorbar(im0, ax=axs[0], label=r"$u_{pred}$")
+        fig.colorbar(im0, ax=axs[0], label=r"u")
 
         im1 = axs[1].pcolormesh(self.x, self.t, self.U_exact, shading='auto', cmap='jet', vmin=vmin, vmax=vmax)
         if self.real_solution is not None:
-            title = r"$u$ analitica" 
+            title = r"Esatta" 
         else:  
             title = r"$u$ di riferimento"
         axs[1].set_title(title)
         axs[1].set_xlabel("x"); axs[1].set_ylabel("t")
-        fig.colorbar(im1, ax=axs[1], label=r"$u_{exact}$")
+        fig.colorbar(im1, ax=axs[1], label=r"$u$")
 
-        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-vmean/3, vmax=vmean/3)
-        axs[2].set_title(r"Errore $\hat{{u}} - u$")
+        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-verr/3, vmax=verr/3)
+        axs[2].set_title(r"Errore")
         axs[2].set_xlabel("x"); axs[2].set_ylabel("t")
         fig.colorbar(im2, ax=axs[2], label="errore")
 
         plt.show()
 
     def plot_slices(self, num_slices=6, vmax = None, vmin = None):
-        time_indices = np.linspace(0, len(self.t) - 1, num_slices, dtype=int)
+        time_indices = np.linspace(1e-3, len(self.t) - 1, num_slices, dtype=int)
 
         if not vmin: vmin = min(self.U_pred.min(), self.U_exact.min())
         if not vmax: vmax = max(self.U_pred.max(), self.U_exact.max())
-
-        plt.figure(figsize=(16, 9))
+        if num_slices>3:
+            plt.figure(figsize=(16, 9))
+        else:
+            plt.figure(figsize=(18, 5))
+        
         for i, idx in enumerate(time_indices):
             t_val = self.t[idx]
             u_pred_slice = self.U_pred[int(idx), :]
             u_rusanov_slice = self.U_exact[int(idx), :]
 
-
-            plt.subplot(2, (num_slices + 1) // 2, i + 1)
-            if self.equation == "burgers":
-                label = 'Rusanov'
-            elif self.equation == "heat":
-                if self.real_solution is not None:
-                    label = 'Exact'
-                else:
+            if num_slices>3:
+                plt.subplot(2, (num_slices + 1) // 2, i + 1)
+            else:
+                plt.subplot(1, num_slices, i + 1)
+            if self.real_solution is not None:
+                label = 'Esatta'
+            else:
+                if self.equation == "burgers":
+                    label = 'Rusanov'
+                elif self.equation == "heat":
                     label = 'FEM'
 
             label0 = "wPINN" if self.model == 'wpinn' else "PINN"
@@ -700,7 +745,7 @@ class ProblemSetUp:
             plt.grid(True)
             plt.legend()
 
-        plt.tight_layout()
+        # plt.tight_layout()
         plt.show()
 
 
