@@ -6,8 +6,9 @@ import torch.autograd as autograd
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-import sympy
-from sympy import printing
+import time
+import os
+import json
 from tqdm import tqdm
 
 
@@ -346,7 +347,7 @@ class PINN:
         total_loss = loss_i + loss_b + loss_f
         return total_loss, (loss_i.item(), loss_b.item(), loss_f.item())
 
-    def Train(self):
+    def Train(self, save_checkpoints=False):
         self.model.train()
         for ep in range(1, self.epochs + 1):
             self.optimizer.zero_grad()
@@ -368,11 +369,11 @@ class PINN:
         Nx, Nt = len(self.x), len(self.t)
         self.U_pred = u_pred.reshape(Nx, Nt).T
 
-    def plot(self):
+    def plot(self, vmin=None, vmax=None):
         import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(8, 5))
         im = ax.imshow(self.U_pred, extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
-                       origin='lower', aspect='auto', cmap='jet')
+                       origin='lower', aspect='auto', cmap='jet', vmin=vmin, vmax=vmax)
         label = 'α' if self.equation == 'heat' else 'ν'
         ax.set_title(rf"PINN $\hat{{u}}(x,t)$ with {label} = {self.nu:.3g}")
         ax.set_xlabel('x'); ax.set_ylabel('t')
@@ -403,7 +404,10 @@ class wPINN:
         self.lambda_bc = lambda_bc
         self.adv_steps = adv_steps
 
+        self.layers = layers
         self.u_net   = MLP(layers).to(self.device)
+        if not path.endswith('.pth'):
+            path += '.pth'
         self.path = path
         self.losses = []
         self.loaded = None
@@ -415,8 +419,8 @@ class wPINN:
             except FileNotFoundError:
                 self.loaded = False
 
-        self.phi_net = MLP(layers).to(self.device)
-        self.xi_net  = MLP(layers).to(self.device)
+        self.phi_net = MLP([2,50,50,50,1]).to(self.device)
+        self.xi_net  = MLP([2,50,50,50,1]).to(self.device)
 
         self.opt_u   = torch.optim.Adam(self.u_net.parameters(),   lr=lr)
         self.opt_phi = torch.optim.Adam(self.phi_net.parameters(), lr=lr)
@@ -429,7 +433,8 @@ class wPINN:
         self.N_ic, self.N_bc, self.N_int = N
         self.epochs = epochs
         self.bc_type = bc_type.lower()
-
+        # self.R = RusanovBurgersSolver(self.u0_np.flatten(), self.x, self.t, nu=0, bc_type=self.bc_type)
+        # self.U_exact = self.R.solve()
     def sample_collocation(self, N):
         t = torch.rand(N,1, device=self.device)*(self.t_max-self.t_min) + self.t_min
         x = torch.rand(N,1, device=self.device)*(self.x_max-self.x_min) + self.x_min
@@ -515,7 +520,11 @@ class wPINN:
             raise ValueError(f"Unknown bc_type {self.bc_type}")
         
 
-    def Train(self):
+    def Train(self, save_checkpoints = False, store_times = False):
+        train_start = time.time()
+        self.times_dict = {}
+        if save_checkpoints: 
+            checkpoints = [100, 250, 500, 1000, 2000, 3000, 4000, 5000, 10000, 15000, 20000]
         for epoch in range(1, self.epochs+1):
             for _ in range(self.adv_steps):
                 t_int, x_int = self.sample_collocation(self.N_int)
@@ -546,12 +555,33 @@ class wPINN:
 
             self.losses.append((Lu_PDE.item(), L_ent.item(), L_ic.item(), L_bc.item(), loss.item()))
 
-            if epoch % (self.epochs//10 or 1) == 0:
+            if epoch % 200 == 0:
                 print(f"wPINN: [{epoch}/{self.epochs}] | Loss={loss.item():.2e} | PDE={Lu_PDE.item():.2e} | Ent={L_ent.item():.2e} | BC={L_bc.item():.2e} | IC={L_ic.item():.2e}")
-        if self.loaded == False:
-            torch.save(self.u_net.state_dict(), self.path)
-            losses = np.array(self.losses)
-            np.save(self.path.replace('.pth', '_losses.npy'), losses)
+            
+            '''
+            if self.loaded == False:
+                if save_checkpoints and epoch in checkpoints:
+                    torch.save(self.u_net.state_dict(), self.path+f'_{epoch}.pth')
+                    losses = np.array(self.losses)
+                    np.save(self.path+f'_{epoch}'+'_losses.npy', losses)
+                elif not save_checkpoints and (epoch == self.epochs):
+                    torch.save(self.u_net.state_dict(), self.path)
+                    losses = np.array(self.losses)
+                    np.save(self.path.replace('.pth', '_losses.npy'), losses)
+            '''
+            if store_times and epoch % 200 == 0:
+                elapsed = time.time() - train_start
+                #self.Pred()
+                #self.U_err = self.U_pred - self.U_exact
+                # l2 = self.l2_error()
+                self.times_dict[str((self.layers, epoch))] = elapsed/60
+                # print(f"[Epoch {epoch}] L2 error = {l2:.3e}, elapsed = {elapsed:.1f}s")
+        times_path = self.path + '_times.json'
+        os.makedirs(os.path.dirname(times_path), exist_ok=True)
+        with open(times_path, 'w') as f:
+            json.dump(self.times_dict, f, indent=4)
+        print(f"Saved timing info to {times_path}")
+
 
     def Pred(self):
         self.u_net.eval()
@@ -560,16 +590,43 @@ class wPINN:
         nt, nx = len(self.t), len(self.x)
         self.U_pred = u_pred.reshape(nt, nx)
 
-    def plot(self):
-        fig, ax = plt.subplots(figsize=(8,5))
-        im = ax.imshow(self.U_pred, extent=[self.x.min(), self.x.max(),
-                                            self.t.min(), self.t.max()],
-                       origin='lower', aspect='auto', cmap='jet')
-        ax.set_title(r"wPINN $\hat{u}(x,t)$")
-        ax.set_xlabel('x'); ax.set_ylabel('t')
-        fig.colorbar(im, ax=ax, label=r'$\hat{u}$')
-        plt.tight_layout(); plt.show()
+    def plot(self, vmin=None, vmax=None):
+        # Imposto i font a 20pt
+        plt.rcParams.update({
+            'font.size':       20,
+            'axes.titlesize':  20,
+            'axes.labelsize':  20,
+            'xtick.labelsize': 20,
+            'ytick.labelsize': 20,
+        })
 
+        fig, ax = plt.subplots(figsize=(8,5))
+        im = ax.imshow(
+            self.U_pred,
+            extent=[self.x.min(), self.x.max(), self.t.min(), self.t.max()],
+            origin='lower', aspect='auto',
+            cmap='jet', vmin=vmin, vmax=vmax
+        )
+        ax.set_title(r"wPINN $\hat{u}(x,t)$")
+        ax.set_xlabel('x')
+        ax.set_ylabel('t')
+        cbar = fig.colorbar(im, ax=ax, label=r'$\hat{u}$')
+        # Anche l'etichetta della colorbar a 20pt
+        cbar.ax.yaxis.get_offset_text().set_fontsize(20)
+        cbar.ax.yaxis.label.set_size(20)
+
+        plt.tight_layout()
+        plt.show()
+
+    def l2_error(self):
+
+        Nt, Nx = self.U_err.shape
+        dx = (self.x_max - self.x_min) / (Nx - 1)
+        dt = (self.t[-1] - self.t[0]) / (Nt - 1)
+
+        l2_abs = np.sqrt(np.sum(self.U_err   ** 2) * dx * dt)
+
+        return l2_abs
 
 
 class ProblemSetUp:
@@ -578,7 +635,7 @@ class ProblemSetUp:
                  equation='burgers', real_solution=None,
                  bc_type='dirichlet', lambda_bc=1.0, 
                  adv_steps=5, model = 'PINN', 
-                 auto_train = True, path=None):
+                 auto_train = True, store_times = False, path=None):
         
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = model.lower()
@@ -597,6 +654,7 @@ class ProblemSetUp:
         self.x_min, self.x_max = float(self.x.min()), float(self.x.max())
         self.t_min, self.t_max = float(self.t.min()), float(self.t.max())
         self.L = self.x_max - self.x_min
+        self.epochs = epochs
 
         if self.model == 'pinn':
             self.pinn = PINN(u0, x, t, layers, epochs=epochs, nu=nu, equation=equation, 
@@ -606,7 +664,7 @@ class ProblemSetUp:
                             lambda_bc=lambda_bc, adv_steps=adv_steps, path=path)
         
         if auto_train and not self.pinn.loaded:
-            self.pinn.Train()
+            self.pinn.Train(save_checkpoints=True)
 
         self.pinn.Pred()
         self.U_pred = self.pinn.U_pred
@@ -625,10 +683,25 @@ class ProblemSetUp:
         self.U_err = self.U_pred - self.U_exact
 
     def plot_losses(self, window: int = 200, eps: float = 1e-8, figsize=(12,6)):
+        # Imposto il font grande prima di plottare
+        plt.rcParams.update({
+            'font.size':           20,
+            'axes.titlesize':      20,
+            'axes.labelsize':      20,
+            'xtick.labelsize':     20,
+            'ytick.labelsize':     20,
+            'legend.fontsize':     20,
+            'legend.title_fontsize':20
+        })
 
-        if not self.losses.any():
-            print("No losses to plot.")
-            return
+        if type(self.losses) == list:
+            if not self.losses:
+                print("No losses to plot.")
+                return
+        else:
+            if self.losses.size == 0:
+                print("No losses to plot.")
+                return
 
         arr = np.array(self.losses, dtype=float)
         N, M = arr.shape
@@ -669,84 +742,147 @@ class ProblemSetUp:
         
         title0 = "wPINN" if self.model == 'wpinn' else "PINN"
 
+        ax.set_title(title0)
         ax.set_xlabel("Epoca")
         ax.set_ylabel("Loss (scala logaritmica)")
-        ax.set_title(title0)
         ax.grid(True, which="both", linestyle="--", linewidth=0.5)
-        ax.legend()
+        ax.legend(title="Componenti")
         plt.tight_layout()
         plt.show()
 
         return fig, ax
 
 
-    def plot_comparison(self):
-        vmin = min(self.U_pred.min(), self.U_exact.min())   
+    def plot(self):
+        # font grande
+        plt.rcParams.update({
+            'font.size':       20,
+            'axes.titlesize':  20,
+            'axes.labelsize':  20,
+            'xtick.labelsize': 20,
+            'ytick.labelsize': 20,
+        })
+
+        vmin = min(self.U_pred.min(), self.U_exact.min())
         vmax = max(self.U_pred.max(), self.U_exact.max())
-        verr = abs(self.U_err[:-2].max())
-        fig, axs = plt.subplots(1, 3, figsize=(18, 5), constrained_layout=True)
-        im0 = axs[0].pcolormesh(self.x, self.t, self.U_pred, shading='auto', cmap='jet', vmin=vmin, vmax=vmax)
-        title0 = "wPINN" if self.model == 'wpinn' else "PINN"
-        axs[0].set_title(title0)
-        axs[0].set_xlabel("x"); axs[0].set_ylabel("t")
-        fig.colorbar(im0, ax=axs[0], label=r"u")
-
-        im1 = axs[1].pcolormesh(self.x, self.t, self.U_exact, shading='auto', cmap='jet', vmin=vmin, vmax=vmax)
-        if self.real_solution is not None:
-            title = r"Esatta" 
-        else:  
-            title = r"$u$ di riferimento"
-        axs[1].set_title(title)
-        axs[1].set_xlabel("x"); axs[1].set_ylabel("t")
-        fig.colorbar(im1, ax=axs[1], label=r"$u$")
-
-        im2 = axs[2].pcolormesh(self.x, self.t, self.U_err, shading='auto', cmap='bwr', vmin=-verr/3, vmax=verr/3)
-        axs[2].set_title(r"Errore")
-        axs[2].set_xlabel("x"); axs[2].set_ylabel("t")
-        fig.colorbar(im2, ax=axs[2], label="errore")
-
-        plt.show()
-
-    def plot_slices(self, num_slices=6, vmax = None, vmin = None):
-        time_indices = np.linspace(1e-3, len(self.t) - 1, num_slices, dtype=int)
-
-        if not vmin: vmin = min(self.U_pred.min(), self.U_exact.min())
-        if not vmax: vmax = max(self.U_pred.max(), self.U_exact.max())
-        if num_slices>3:
-            plt.figure(figsize=(16, 9))
-        else:
-            plt.figure(figsize=(18, 5))
         
-        for i, idx in enumerate(time_indices):
+        print("Predizione PINN")
+        self.pinn.plot(vmin=vmin, vmax=vmax)
+        
+        print("Rusanov")
+        self.R.plot(cmap='jet', vmin=vmin, vmax=vmax)
+
+    def plot_comparison(self, num_slices=3, vmax=None, vmin=None):
+
+        # dimensione font
+        plt.rcParams.update({
+            'font.size':       20,
+            'axes.titlesize':  20,
+            'axes.labelsize':  20,
+            'xtick.labelsize': 20,
+            'ytick.labelsize': 20,
+            'legend.fontsize': 20,
+        })
+
+        # limiti dati
+        vmin = vmin if vmin is not None else min(self.U_pred.min(), self.U_exact.min())
+        vmax = vmax if vmax is not None else max(self.U_pred.max(), self.U_exact.max())
+        verr = abs(self.U_err[:-2].max())
+
+        # istanti temporali per i profili
+        time_indices = np.linspace(1, len(self.t) - 1, num_slices, dtype=int)
+
+        # figura 2×3 con constrained_layout
+        fig, axs = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+
+        # --- RIGA 1: le tre mappe -----------------------------------------------
+        # 1) PINN
+        im_pred = axs[0, 0].pcolormesh(self.x, self.t, self.U_pred,
+                                    shading='auto', cmap='jet',
+                                    vmin=vmin, vmax=vmax)
+        
+        title0 = "wPINN" if self.model == 'wpinn' else "PINN"
+        axs[0, 0].set_title(title0)
+        axs[0, 0].set_xlabel("x")
+        axs[0, 0].set_ylabel("t")
+
+        # 2) Riferimento
+        im_ref = axs[0, 1].pcolormesh(self.x, self.t, self.U_exact,
+                                    shading='auto', cmap='jet',
+                                    vmin=vmin, vmax=vmax)
+        
+        axs[0, 1].set_title("Riferimento")
+        axs[0, 1].set_xlabel("x")
+        axs[0, 1].set_ylabel("t")
+
+        # 3) Errore
+        if verr > 0.25:
+            verr/=3
+        else:
+            verr*=3
+        im_err = axs[0, 2].pcolormesh(self.x, self.t, self.U_err,
+                                    shading='auto', cmap='bwr',
+                                    vmin=-verr, vmax=verr)
+        axs[0, 2].set_title("Errore")
+        axs[0, 2].set_xlabel("x")
+        axs[0, 2].set_ylabel("t")
+
+        # unica colorbar a sinistra per PINN+Riferimento
+        cbar_left = fig.colorbar(
+            im_pred,
+            ax=[axs[0,0], axs[0,1]],
+            location='left',
+            pad=0.02,
+        )
+        cbar_left.ax.yaxis.set_tick_params(labelsize=20)
+        cbar_left.ax.yaxis.label.set_size(20)
+
+        # unica colorbar a destra per Errore
+        cbar_right = fig.colorbar(
+            im_err,
+            ax=axs[0,2],
+            location='right',
+            pad=0.02,
+        )
+        cbar_right.ax.yaxis.set_tick_params(labelsize=20)
+        cbar_right.ax.yaxis.label.set_size(20)
+
+        # --- RIGA 2: profili ----------------------------------------------------
+        # raccogliamo handle & label per una sola legenda
+        legend_handles, legend_labels = None, None
+
+        for j, idx in enumerate(time_indices):
+            ax = axs[1, j]
             t_val = self.t[idx]
-            u_pred_slice = self.U_pred[int(idx), :]
-            u_rusanov_slice = self.U_exact[int(idx), :]
+            u_ref  = self.U_exact[idx, :]
+            u_pred = self.U_pred[idx, :]
 
-            if num_slices>3:
-                plt.subplot(2, (num_slices + 1) // 2, i + 1)
-            else:
-                plt.subplot(1, num_slices, i + 1)
-            if self.real_solution is not None:
-                label = 'Esatta'
-            else:
-                if self.equation == "burgers":
-                    label = 'Rusanov'
-                elif self.equation == "heat":
-                    label = 'FEM'
+            lbl_ref  = ("Esatto" if self.real_solution is not None
+                        else ("Rusanov" if self.equation=="burgers" else "FEM"))
+            lbl_pred = "wPINN" if self.model=="wpinn" else "PINN"
 
-            label0 = "wPINN" if self.model == 'wpinn' else "PINN"
-            plt.plot(self.x, u_rusanov_slice, 'k-', linewidth=1.5, label=label)
-            plt.plot(self.x, u_pred_slice, 'r--', linewidth=1.5, label=label0)
+            h1, = ax.plot(self.x, u_ref,  'k-',  linewidth=2, label=lbl_ref)
+            h2, = ax.plot(self.x, u_pred, 'r--', linewidth=2, label=lbl_pred)
 
-            plt.title(f't = {t_val:.3f}')
-            plt.xlabel('x')
-            plt.ylabel('u(x,t)')
-            plt.ylim(vmin, vmax)
-            plt.grid(True)
-            plt.legend()
+            ax.set_title(f"t = {t_val:.3f}")
+            ax.set_xlabel("x")
+            ax.set_ylabel("u(x,t)")
+            ax.set_ylim(vmin, vmax)
+            ax.grid(True)
 
-        # plt.tight_layout()
+            if legend_handles is None:
+                legend_handles = [h1, h2]
+                legend_labels  = [lbl_ref, lbl_pred]
+
+        # legenda unica in basso, con spazio extra
+        fig.legend(
+            legend_handles, legend_labels,
+            loc='lower center', ncol=2,
+            bbox_to_anchor=(0.5, -0.08)
+        )
+
         plt.show()
+
 
 
     def l2_error(self):
@@ -756,10 +892,11 @@ class ProblemSetUp:
         dt = (self.t[-1] - self.t[0]) / (Nt - 1)
 
         l2_abs = np.sqrt(np.sum(self.U_err   ** 2) * dx * dt)
-        l2_exact = np.sqrt(np.sum(self.U_exact ** 2) * dx * dt)
-        l2_rel = l2_abs / l2_exact if l2_exact != 0 else float('inf')
+        l2_rel = np.sqrt(np.sum(self.U_err** 2))
 
         header = "Metriche di Errore L2"
         print(f"\n{header}\n{'-' * len(header)}")
         print(f"{'Errore L2 assoluto':<30}: {l2_abs:.6e}")
         print(f"{'Errore L2 relativo':<30}: {l2_rel:.6e}\n")
+
+        return l2_abs
